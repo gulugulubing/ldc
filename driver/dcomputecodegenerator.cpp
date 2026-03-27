@@ -17,7 +17,7 @@
 #include <string>
 #include <algorithm>
 
-#if !(LDC_LLVM_SUPPORTED_TARGET_SPIRV || LDC_LLVM_SUPPORTED_TARGET_NVPTX)
+#if !(LDC_LLVM_SUPPORTED_TARGET_SPIRV || LDC_LLVM_SUPPORTED_TARGET_NVPTX || LDC_LLVM_SUPPORTED_TARGET_METAL)
 
 DComputeCodeGenManager::DComputeCodeGenManager(llvm::LLVMContext &c) : ctx(c) {}
 void DComputeCodeGenManager::emit(Module *) {}
@@ -56,6 +56,23 @@ DComputeCodeGenManager::createComputeTarget(const std::string &s) {
     }
 #else
     error(Loc(), "LDC was not built with CUDA DCompute support.");
+#endif
+  }
+
+    if (s.substr(0, 6) == "metal-") {
+#if LDC_LLVM_SUPPORTED_TARGET_METAL
+#define METAL_VALID_VER_INIT 20, 21, 30
+    const std::array<int, 3> valid_metal_versions = {{METAL_VALID_VER_INIT}};
+    const int v = atoi(s.c_str() + 6);
+
+    if (std::find(valid_metal_versions.begin(), valid_metal_versions.end(), v) !=
+        valid_metal_versions.end()) {
+      return createMetalTarget(ctx, v);
+    }
+
+    error(Loc(), "Unsupported Metal version '%d'", v);
+#else
+    error(Loc(), "LDC was not built with Metal DCompute support.");
 #endif
   }
 

@@ -14,6 +14,7 @@
 #pragma once
 
 #include "gen/abi/generic.h"
+#include "gen/dcompute/druntime.h"
 
 struct DComputePointerRewrite : ABIRewrite {
   LLValue *put(DValue *v, bool isLValueExp, bool) override {
