@@ -648,7 +648,10 @@ createTargetMachine(const std::string targetTriple, const std::string arch,
 }
 
 ComputeBackend::Type getComputeTargetType(llvm::Module* m) {
-  llvm::Triple::ArchType a = llvm::Triple(m->getTargetTriple()).getArch();
+  llvm::Triple triple(m->getTargetTriple());
+  if (triple.getArchName().starts_with("air"))
+    return ComputeBackend::AIR;
+  llvm::Triple::ArchType a = triple.getArch();
   if (a == llvm::Triple::spir || a == llvm::Triple::spir64)
     return ComputeBackend::SPIRV;
   else if (a == llvm::Triple::nvptx || a == llvm::Triple::nvptx64)

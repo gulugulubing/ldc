@@ -46,7 +46,7 @@ public:
 
   void emit(Module *m);
   void doCodeGen(Module *m);
-  void writeModule();
+  virtual void writeModule();
 
   virtual void addMetadata() = 0;
   virtual void addKernelMetadata(FuncDeclaration *df,

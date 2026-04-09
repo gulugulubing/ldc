@@ -569,6 +569,10 @@ bool ldc_optimize_module(llvm::Module *M, llvm::TargetMachine *TM) {
   // TODO: run rudimentary optimisations to improve IR debuggability.
   if (getComputeTargetType(M) == ComputeBackend::SPIRV)
     return false;
+  // AIR modules are emitted as LLVM bitcode; Apple's metallib handles
+  // final optimization.  Skip LLVM machine-level passes here.
+  if (getComputeTargetType(M) == ComputeBackend::AIR)
+    return false;
 #endif
 
   runOptimizationPasses(M, TM);
