@@ -37,6 +37,7 @@
 #include "gen/optimizer.h"
 #include "driver/cl_options.h"
 #include "driver/targetmachine.h"
+#include "driver/tool.h"
 #include "dmd/declaration.h"
 #include "dmd/errors.h"
 #include "dmd/globals.h"
@@ -56,6 +57,8 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/ModRef.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/Process.h"
+#include "llvm/Support/Program.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
@@ -66,6 +69,7 @@
 #include "llvm/Transforms/Scalar/SROA.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
 
+#include <regex>
 #include <string>
 
 using namespace dmd;
@@ -229,7 +233,10 @@ static void applyMetalKernelAttributes(llvm::LLVMContext &C, llvm::Function *F) 
   B.addAttribute(llvm::Attribute::NoSync);
   B.addAttribute(llvm::Attribute::NoUnwind);
   B.addAttribute(llvm::Attribute::WillReturn);
-  B.addAttribute(llvm::Attribute::NoBuiltin);
+  // Apple uses the *string* attribute "no-builtins" (not the LLVM enum
+  // `nobuiltin`).  The enum form encodes differently in bitcode and crashes
+  // Apple's Metal compiler ("internal error").
+  B.addAttribute(llvm::Attribute::get(C, "no-builtins"));
   // Deliberately omit memory(argmem: write) — Apple's air-as / metallib
   // toolchain uses an older LLVM fork that can't parse it, and it's only
   // an optimisation hint.
@@ -291,6 +298,298 @@ static void eraseUnusedNonKernelFunctions(
   }
   for (auto *F : dead)
     F->eraseFromParent();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Opaque → typed pointer conversion for Apple Metal toolchain compatibility
+//
+// LLVM 22 uses opaque pointers (`ptr`) exclusively, but Apple's Metal
+// runtime JIT (based on an older LLVM fork) requires typed pointers
+// (`float*`, `i32*`, etc.) in AIR bitcode.  We emit textual IR from our
+// module, convert `ptr` references to typed pointers, then invoke
+// `xcrun metal -c -x ir` to produce Apple-compatible .air bitcode.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Format an LLVM type as a typed-pointer-era textual representation.
+/// E.g., a float → "float", a FixedVectorType<3 x i32> → "<3 x i32>".
+/// For function types: "void (float addrspace(1)*, <3 x i32>)".
+static std::string typeToString(llvm::Type *T, unsigned AS = 0) {
+  if (T->isFloatTy())  return "float";
+  if (T->isDoubleTy()) return "double";
+  if (T->isHalfTy())   return "half";
+  if (T->isVoidTy())   return "void";
+  if (auto *IT = llvm::dyn_cast<llvm::IntegerType>(T))
+    return "i" + std::to_string(IT->getBitWidth());
+  if (auto *VT = llvm::dyn_cast<llvm::FixedVectorType>(T)) {
+    return "<" + std::to_string(VT->getNumElements()) + " x " +
+           typeToString(VT->getElementType()) + ">";
+  }
+  if (auto *FT = llvm::dyn_cast<llvm::FunctionType>(T)) {
+    std::string s = typeToString(FT->getReturnType()) + " (";
+    for (unsigned i = 0; i < FT->getNumParams(); ++i) {
+      if (i) s += ", ";
+      auto *PT = FT->getParamType(i);
+      if (PT->isPointerTy()) {
+        s += "i8*";
+      } else {
+        s += typeToString(PT);
+      }
+    }
+    s += ")";
+    return s;
+  }
+  if (T->isPointerTy()) {
+    std::string s = "i8";
+    if (AS)
+      s += " addrspace(" + std::to_string(AS) + ")";
+    s += "*";
+    return s;
+  }
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  T->print(os);
+  return s;
+}
+
+/// Convert LLVM 22 opaque-pointer textual IR to typed-pointer syntax
+/// so Apple's Metal toolchain can assemble it.
+///
+/// This handles the specific IR patterns our Metal kernel pass produces:
+///   - store/load/GEP with ptr addrspace(N)
+///   - function definitions with ptr parameters
+///   - metadata references to kernel functions
+static std::string convertToTypedPointerIR(
+    const std::string &ir,
+    llvm::Module &mod,
+    llvm::ArrayRef<llvm::Function *> kernelFns) {
+
+  // Build a map of function names to their typed pointer reference strings.
+  llvm::StringMap<std::string> fnTypedRef;
+  for (auto *F : kernelFns) {
+    // Determine actual buffer element types from store/load/GEP usage.
+    llvm::SmallVector<std::string, 4> paramTypes;
+    auto *FT = F->getFunctionType();
+    for (unsigned i = 0; i < FT->getNumParams(); ++i) {
+      if (!FT->getParamType(i)->isPointerTy()) {
+        paramTypes.push_back(typeToString(FT->getParamType(i)));
+        continue;
+      }
+      // Scan uses of this pointer arg to find the element type.
+      std::string elemType = "i8"; // fallback
+      for (auto &U : F->getArg(i)->uses()) {
+        if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(U.getUser())) {
+          if (SI->getPointerOperand() == F->getArg(i) ||
+              true) { // any store involving this ptr
+            elemType = typeToString(SI->getValueOperand()->getType());
+            break;
+          }
+        } else if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(U.getUser())) {
+          elemType = typeToString(LI->getType());
+          break;
+        } else if (auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(
+                       U.getUser())) {
+          elemType = typeToString(GEP->getSourceElementType());
+          break;
+        }
+      }
+      paramTypes.push_back(elemType + " addrspace(1)*");
+    }
+
+    // Build the typed function pointer string.
+    std::string sig = typeToString(FT->getReturnType()) + " (";
+    for (unsigned i = 0; i < paramTypes.size(); ++i) {
+      if (i) sig += ", ";
+      sig += paramTypes[i];
+    }
+    sig += ")*";
+    fnTypedRef[F->getName()] = sig;
+  }
+
+  // First pass: strip LLVM 22-specific keywords that Apple's older LLVM
+  // fork doesn't understand.
+  std::string sanitized = ir;
+  {
+    // `nuw` (no unsigned wrap) on GEP — added in LLVM 18.
+    std::regex nuwRe(R"(getelementptr inbounds nuw )");
+    sanitized = std::regex_replace(sanitized, nuwRe, "getelementptr inbounds ");
+    // `nusw` (no unsigned signed wrap) on GEP — also newer.
+    std::regex nuswRe(R"(getelementptr inbounds nusw )");
+    sanitized = std::regex_replace(sanitized, nuswRe, "getelementptr inbounds ");
+  }
+
+  // Line-by-line conversion.
+  std::string result;
+  result.reserve(sanitized.size() + 256);
+  std::istringstream iss(sanitized);
+  std::string line;
+
+  // Regex patterns for instruction-level ptr → typed ptr conversion.
+  // store <type> <val>, ptr [addrspace(N)] <dest>
+  std::regex storeRe(
+      R"((\s*store\s+)(\S+)(\s+.+,\s+)ptr(\s+addrspace\(\d+\))?\s+(.+))");
+  // load <type>, ptr [addrspace(N)] <src>
+  std::regex loadRe(
+      R"((\s*%\S+\s*=\s*load\s+)(\S+)(,\s+)ptr(\s+addrspace\(\d+\))?\s+(.+))");
+  // getelementptr [inbounds] [nuw] <type>, ptr [addrspace(N)] <base>
+  std::regex gepRe(
+      R"((\s*%\S+\s*=\s*getelementptr\s+(?:inbounds\s+)?(?:nuw\s+)?)(\S+)(,\s+)ptr(\s+addrspace\(\d+\))?\s+(.+))");
+  // metadata: ptr @funcname
+  std::regex mdFnPtrRe(R"(ptr\s+@(\w+))");
+
+  while (std::getline(iss, line)) {
+    std::smatch m;
+
+    // store instruction
+    if (std::regex_match(line, m, storeRe)) {
+      std::string ty = m[2].str();
+      std::string as = m[4].str();
+      result += m[1].str() + ty + m[3].str() + ty + as + "* " +
+                m[5].str() + "\n";
+      continue;
+    }
+
+    // load instruction
+    if (std::regex_match(line, m, loadRe)) {
+      std::string ty = m[2].str();
+      std::string as = m[4].str();
+      result += m[1].str() + ty + m[3].str() + ty + as + "* " +
+                m[5].str() + "\n";
+      continue;
+    }
+
+    // getelementptr instruction
+    if (std::regex_match(line, m, gepRe)) {
+      std::string ty = m[2].str();
+      std::string as = m[4].str();
+      result += m[1].str() + ty + m[3].str() + ty + as + "* " +
+                m[5].str() + "\n";
+      continue;
+    }
+
+    // Function definition: replace ptr addrspace(N) params with typed ptrs.
+    if (line.find("define ") != std::string::npos) {
+      for (auto *F : kernelFns) {
+        std::string name = "@" + F->getName().str() + "(";
+        auto pos = line.find(name);
+        if (pos == std::string::npos)
+          continue;
+
+        // Rebuild the param list with typed pointers.
+        auto *FT = F->getFunctionType();
+        std::string newParams;
+        auto sigStart = line.find('(', pos);
+        auto sigEnd = line.rfind(')');
+        if (sigStart == std::string::npos || sigEnd == std::string::npos)
+          break;
+
+        // Parse the original parameter text to preserve attributes.
+        std::string origParams =
+            line.substr(sigStart + 1, sigEnd - sigStart - 1);
+
+        // Split by comma while respecting nested parens/quotes.
+        llvm::SmallVector<std::string, 4> paramStrs;
+        {
+          int depth = 0;
+          bool inQuote = false;
+          std::string cur;
+          for (char c : origParams) {
+            if (c == '"') inQuote = !inQuote;
+            if (!inQuote) {
+              if (c == '(' || c == '<') depth++;
+              if (c == ')' || c == '>') depth--;
+              if (c == ',' && depth == 0) {
+                paramStrs.push_back(cur);
+                cur.clear();
+                continue;
+              }
+            }
+            cur += c;
+          }
+          if (!cur.empty()) paramStrs.push_back(cur);
+        }
+
+        // Replace `ptr addrspace(N)` in each parameter with typed pointer.
+        unsigned argIdx = 0;
+        for (auto &ps : paramStrs) {
+          // Find "ptr addrspace(N)" or bare "ptr" and replace.
+          std::regex ptrAsRe(R"(ptr(\s+addrspace\(\d+\))?)");
+          if (argIdx < FT->getNumParams() &&
+              FT->getParamType(argIdx)->isPointerTy()) {
+            // Use the typed ref we computed earlier.
+            auto it = fnTypedRef.find(F->getName());
+            if (it != fnTypedRef.end()) {
+              // Extract the individual param type from our fnTypedRef.
+              // For now, scan uses to determine element type.
+              std::string elemType = "i8";
+              for (auto &U : F->getArg(argIdx)->uses()) {
+                if (auto *SI =
+                        llvm::dyn_cast<llvm::StoreInst>(U.getUser())) {
+                  elemType =
+                      typeToString(SI->getValueOperand()->getType());
+                  break;
+                } else if (auto *LI =
+                               llvm::dyn_cast<llvm::LoadInst>(U.getUser())) {
+                  elemType = typeToString(LI->getType());
+                  break;
+                } else if (auto *GEP =
+                               llvm::dyn_cast<llvm::GetElementPtrInst>(
+                                   U.getUser())) {
+                  elemType = typeToString(GEP->getSourceElementType());
+                  break;
+                }
+              }
+              std::string replacement = elemType + "$1*";
+              ps = std::regex_replace(ps, ptrAsRe, replacement);
+            }
+          }
+          argIdx++;
+        }
+
+        // Reassemble.
+        std::string newSig;
+        for (unsigned i = 0; i < paramStrs.size(); ++i) {
+          if (i) newSig += ",";
+          newSig += paramStrs[i];
+        }
+        line = line.substr(0, sigStart + 1) + newSig +
+               line.substr(sigEnd);
+        break;
+      }
+    }
+
+    // Metadata: replace `ptr @funcname` with typed function pointer ref.
+    if (line.find("!{") != std::string::npos) {
+      for (auto &[name, typedRef] : fnTypedRef) {
+        std::string needle = "ptr @" + name.str();
+        auto pos = line.find(needle);
+        if (pos != std::string::npos) {
+          line.replace(pos, needle.size(),
+                       typedRef + " @" + name.str());
+        }
+      }
+    }
+
+    result += line + "\n";
+  }
+
+  return result;
+}
+
+/// Find `xcrun` and invoke `xcrun metal -c -x ir <input.ll> -o <output.air>`.
+/// Returns true on success.
+static bool assembleWithXcrunMetal(const std::string &llPath,
+                                   const std::string &airPath) {
+  auto xcrun = llvm::sys::findProgramByName("xcrun");
+  if (!xcrun) {
+    error(Loc(), "cannot find `xcrun` — is Xcode or CommandLineTools installed?");
+    return false;
+  }
+
+  std::vector<std::string> args = {
+      "metal", "-c", "-x", "ir", llPath, "-o", airPath};
+
+  int status = executeToolAndWait(Loc(), "xcrun", args, /*verbose=*/false);
+  return status == 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -382,14 +681,32 @@ public:
 
     cleanupPlaceholderDecls(_ir->module);
 
-    // Step 3: Emit module-level metadata.
+    // Step 3: Rename kernel functions to clean names.
+    // Metal's host API (newFunctionWithName:) looks up kernels by name, so
+    // we must strip D mangling.  Use pragma(mangle, ...) override if the
+    // user set one, otherwise fall back to the D identifier.
+    for (auto &ki : kernels) {
+      llvm::StringRef cleanName;
+      std::string overrideBuf;
+
+      if (ki.fd->mangleOverride.length) {
+        overrideBuf.assign(ki.fd->mangleOverride.ptr,
+                           ki.fd->mangleOverride.length);
+        cleanName = overrideBuf;
+      } else {
+        cleanName = ki.fd->ident->toChars();
+      }
+      ki.fn->setName(cleanName);
+    }
+
+    // Step 4: Emit module-level metadata.
     addMetadata();
 
-    // Step 4: Emit per-kernel metadata (now aware of injected attr params).
+    // Step 5: Emit per-kernel metadata (now aware of injected attr params).
     for (auto &ki : kernels)
       emitKernelMD(ki.fd, ki.fn, ki.attrs);
 
-    // Step 5: Kernel function attributes + IR cleanup (Apple AIR parity).
+    // Step 6: Kernel function attributes + IR cleanup (Apple AIR parity).
     llvm::SmallVector<llvm::Function *, 4> kernelFns;
     for (auto &ki : kernels)
       kernelFns.push_back(ki.fn);
@@ -399,7 +716,7 @@ public:
     eraseUnusedNonKernelFunctions(_ir->module, kernelFns);
     cleanupPlaceholderDecls(_ir->module);
 
-    // Step 6: Build output path.
+    // Step 7: Build output path.
     std::string filename;
     llvm::raw_string_ostream os(filename);
     os << opts::dcomputeFilePrefix << '_' << short_name << tversion
@@ -408,7 +725,7 @@ public:
     const char *path =
         FileName::combine(global.params.objdir.ptr, os.str().c_str());
 
-    // Step 7: Verify the module before writing.
+    // Step 8: Verify the module before writing.
     if (llvm::verifyModule(_ir->module, &llvm::errs())) {
       error(Loc(), "Metal AIR module verification failed");
       fatal();
@@ -425,15 +742,42 @@ public:
 
     Logger::println("Writing Metal AIR bitcode to: %s", path);
 
-    std::error_code errinfo;
-    llvm::ToolOutputFile bos(path, errinfo, llvm::sys::fs::OF_None);
-    if (bos.os().has_error()) {
-      error(Loc(), "cannot write Metal AIR file '%s': %s", path,
-            errinfo.message().c_str());
-      fatal();
+    // LLVM 22 writes opaque-pointer bitcode that Apple's Metal runtime
+    // cannot JIT-compile.  Instead, emit textual IR, convert opaque ptrs
+    // to typed ptrs, and let `xcrun metal -c -x ir` produce compatible
+    // AIR bitcode.
+    {
+      // Print module to textual IR.
+      std::string irText;
+      llvm::raw_string_ostream irOS(irText);
+      _ir->module.print(irOS, nullptr);
+
+      // Convert opaque pointers → typed pointers.
+      std::string typedIR =
+          convertToTypedPointerIR(irText, _ir->module, kernelFns);
+
+      // Write to a temporary .ll file next to the output.
+      std::string llPath = std::string(path) + ".ll";
+      {
+        std::error_code ec;
+        llvm::raw_fd_ostream llOS(llPath, ec, llvm::sys::fs::OF_Text);
+        if (ec) {
+          error(Loc(), "cannot write temporary IR file '%s': %s",
+                llPath.c_str(), ec.message().c_str());
+          fatal();
+        }
+        llOS << typedIR;
+      }
+
+      // Assemble with Apple's Metal compiler.
+      if (!assembleWithXcrunMetal(llPath, path)) {
+        error(Loc(), "xcrun metal failed to assemble '%s'", llPath.c_str());
+        fatal();
+      }
+
+      // Clean up temp .ll file.
+      llvm::sys::fs::remove(llPath);
     }
-    llvm::WriteBitcodeToFile(_ir->module, bos.os());
-    bos.keep();
 
     delete _ir;
     _ir = nullptr;
@@ -634,14 +978,21 @@ private:
 
   // ── Build metadata for an injected Metal attribute parameter ──────────
   //
-  // Shape: !{i32 <paramIdx>, !"<air_attribute_name>"}
+  // Apple's format:
+  //   !{i32 <paramIdx>, !"<air_attr_name>",
+  //    !"air.arg_type_name", !"uint3", !"air.arg_name", !"<name>"}
 
   llvm::Metadata *buildAttrParamMD(const InjectedAttr &attr) {
     auto *i32Ty = llvm::Type::getInt32Ty(ctx);
+    auto ms = [&](llvm::StringRef s) -> llvm::Metadata * {
+      return llvm::MDString::get(ctx, s);
+    };
     llvm::Metadata *fields[] = {
         llvm::ConstantAsMetadata::get(
             llvm::ConstantInt::get(i32Ty, attr.paramIdx)),
-        llvm::MDString::get(ctx, attr.airName)};
+        ms(attr.airName),
+        ms("air.arg_type_name"), ms("uint3"),
+        ms("air.arg_name"),      ms(attr.airName)};
     return llvm::MDTuple::get(ctx, fields);
   }
 
