@@ -405,8 +405,8 @@ static std::string convertToTypedPointerIR(
     fnTypedRef[F->getName()] = sig;
   }
 
-  // First pass: strip LLVM 22-specific keywords that Apple's older LLVM
-  // fork doesn't understand.
+  // First pass: rewrite LLVM 22-specific syntax to forms Apple's older LLVM
+  // fork understands.
   std::string sanitized = ir;
   {
     // `nuw` (no unsigned wrap) on GEP — added in LLVM 18.
@@ -415,6 +415,35 @@ static std::string convertToTypedPointerIR(
     // `nusw` (no unsigned signed wrap) on GEP — also newer.
     std::regex nuswRe(R"(getelementptr inbounds nusw )");
     sanitized = std::regex_replace(sanitized, nuswRe, "getelementptr inbounds ");
+
+    // `captures(none)` → `nocapture`  (LLVM 19+ replaced nocapture)
+    std::regex capturesNoneRe(R"(captures\(none\))");
+    sanitized = std::regex_replace(sanitized, capturesNoneRe, "nocapture");
+
+    // `dead_on_unwind` — LLVM 19+ attribute, Apple doesn't know it.
+    std::regex deadOnUnwindRe(R"(\bdead_on_unwind\b)");
+    sanitized = std::regex_replace(sanitized, deadOnUnwindRe, "");
+
+    // `writable` — LLVM 19+ parameter attribute, Apple doesn't know it.
+    std::regex writableRe(R"(\bwritable\b)");
+    sanitized = std::regex_replace(sanitized, writableRe, "");
+
+    // `initializes(...)` — LLVM 19+ attribute, strip entirely.
+    std::regex initializesRe(R"(initializes\([^)]*\))");
+    sanitized = std::regex_replace(sanitized, initializesRe, "");
+
+    // `range(ty min, max)` — LLVM 19+ parameter attribute, strip entirely.
+    std::regex rangeRe(R"(range\([^)]*\))");
+    sanitized = std::regex_replace(sanitized, rangeRe, "");
+
+    // `memory(...)` on function definitions — LLVM 16+ replaced
+    // argmemonly/readnone/etc.  Apple's Metal toolchain doesn't understand it.
+    std::regex memoryRe(R"(\bmemory\([^)]*\))");
+    sanitized = std::regex_replace(sanitized, memoryRe, "");
+
+    // Clean up double-spaces left by removed attributes.
+    std::regex dblSpace(R"(  +)");
+    sanitized = std::regex_replace(sanitized, dblSpace, " ");
   }
 
   // Line-by-line conversion.
@@ -948,9 +977,27 @@ private:
             (ptr = toDcomputePointer(
                  static_cast<TypeStruct *>(baseTy)->sym))) {
           inputArgs.push_back(buildBufferParamMD(i, bufferIdx, *ptr, v));
-          // Try to match Apple kernels: pointer args are noundef + nocapture.
-          // For the Metal API, this can affect pipeline validation.
+          // Match Apple-generated kernel signatures: buffer pointer params
+          // carry nocapture, noundef, writeonly/readonly, and air-buffer-no-alias.
           llf->addParamAttr(i, llvm::Attribute::NoUndef);
+#if LDC_LLVM_VER >= 2100
+          {
+            llvm::AttrBuilder ab(ctx);
+            ab.addCapturesAttr(llvm::CaptureInfo::none());
+            llf->addParamAttrs(i, ab);
+          }
+#else
+          llf->addParamAttr(i, llvm::Attribute::NoCapture);
+#endif
+          {
+            bool isConst = (ptr->type->mod & (MODconst | MODimmutable)) != 0;
+            if (isConst)
+              llf->addParamAttr(i, llvm::Attribute::ReadOnly);
+            else
+              llf->addParamAttr(i, llvm::Attribute::WriteOnly);
+          }
+          llf->addParamAttr(i,
+              llvm::Attribute::get(ctx, "air-buffer-no-alias"));
           ++bufferIdx;
         } else {
           inputArgs.push_back(buildScalarParamMD(i, bufferIdx, v));
