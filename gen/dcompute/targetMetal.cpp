@@ -284,9 +284,11 @@ static void runMetalAIRCleanupPasses(llvm::Module &M) {
   MPM.addPass(llvm::GlobalDCEPass());
   MPM.run(M, MAM);
 
-  // InstCombine (LLVM 18+) can emit `icmp samesign …`.  Apple's `metal -c`
-  // front end can reject that token; normalize to a plain predicate.
-#if LDC_LLVM_VER >= 1800
+  // InstCombine can mark `icmp` with SameSign (prints as `icmp samesign`;
+  // `ICmpInst::hasSameSign()` exists from LLVM 20). Apple's Metal stack can
+  // reject that bitcode encoding. Strip the flag when the LLVM API is
+  // available.
+#if LDC_LLVM_VER >= 2000
   for (llvm::Function &F : M) {
     if (F.isDeclaration())
       continue;
@@ -308,7 +310,7 @@ static void runMetalAIRCleanupPasses(llvm::Module &M) {
       }
     }
   }
-#endif // LDC_LLVM_VER >= 1800
+#endif // LDC_LLVM_VER >= 2000
 }
 
 /// Remove uninlined device helpers (e.g. `GlobalIndex.x` templates) so
