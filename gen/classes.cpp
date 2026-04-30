@@ -279,7 +279,7 @@ DValue *DtoCastClass(Loc loc, DValue *val, Type *_to) {
 
   // Qualifier-only casts are semantic no-ops; avoid dynamic cast routing.
   if (dmd::equivalent(from, to)) {
-    Logger::println("qualifier-only cast");
+    IF_LOG Logger::println("qualifier-only cast");
     return new DImValue(_to, DtoRVal(val));
   }
 
