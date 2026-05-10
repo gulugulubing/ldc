@@ -14,15 +14,11 @@
 // Optionally keep a textual `*.air.ll` beside the output for debugging.
 // Packaging to a `.metallib` is performed by the usual `xcrun metallib` step.
 //
-// Thread-index lowering (Option 2 — on-demand synthetic intrinsic):
+// Thread-index lowering:
 //
-//   The dcompute library declares placeholder functions such as
-//   @air.thread_position_in_grid.x via pragma(mangle, ...).  During
-//   writeModule(), after running AlwaysInlinerPass to inline GlobalIndex.x
-//   etc. into kernels, we scan each kernel body for calls to these
-//   placeholders, inject <3 x i32> parameters for each attribute actually
-//   used, replace the calls with extractelement, and emit the matching
-//   AIR metadata.
+//   The dcompute library maps index helpers such as GlobalIndex.x directly to
+//   AIR's dimension-taking intrinsics (`air.get_global_id.i32(0)` etc.).
+//   No synthetic kernel parameters or index metadata are needed.
 //
 // After emission, kernel functions get Apple-style fnattrs, then SROA /
 // mem2reg / instcombine / DCE (+ dead helper removal) so IR resembles
@@ -60,8 +56,8 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
-#include "llvm/Transforms/IPO/AlwaysInliner.h"
 #include "llvm/Transforms/IPO/GlobalDCE.h"
+#include "llvm/Transforms/IPO/Inliner.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar/DCE.h"
 #include "llvm/Transforms/Scalar/SROA.h"
@@ -73,157 +69,10 @@ using namespace dmd;
 
 namespace {
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Metal attribute parameter injection (Option 2)
-// ═══════════════════════════════════════════════════════════════════════════
-
-// AIR attribute names that correspond to Metal kernel parameter attributes.
-// Each one maps to a family of three placeholder functions: <base>.{x,y,z}
-static const llvm::StringRef metalAttrNames[] = {
-    "air.thread_position_in_grid",
-    "air.thread_position_in_threadgroup",
-    "air.threadgroup_position_in_grid",
-    "air.threads_per_grid",
-    "air.threads_per_threadgroup",
-    "air.threadgroups_per_grid",
-};
-
 // AIR triple / SDK banner in module metadata (`metallib` / active Xcode Metal).
 constexpr char kMetalAirTargetTriple[] = "air64_v28-apple-macosx26.0.0";
 constexpr int kMetalSdkVersionMajor = 26;
 constexpr int kMetalSdkVersionMinor = 4;
-
-struct InjectedAttr {
-  llvm::StringRef airName;
-  unsigned paramIdx = 0;
-  llvm::SmallVector<llvm::CallInst *, 4> calls[3]; // [0]=x [1]=y [2]=z
-};
-
-// Scan a function body for calls to Metal attribute placeholder functions.
-// Groups them by attribute base name.
-static void collectAttrCalls(llvm::Function *F,
-                             llvm::SmallVector<InjectedAttr> &result) {
-  llvm::StringMap<unsigned> nameToIdx;
-
-  for (auto &BB : *F) {
-    for (auto &I : BB) {
-      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
-      if (!CI)
-        continue;
-      auto *callee = CI->getCalledFunction();
-      if (!callee)
-        continue;
-
-      llvm::StringRef name = callee->getName();
-      for (const auto &attrName : metalAttrNames) {
-        if (!name.starts_with(attrName))
-          continue;
-        llvm::StringRef suffix = name.drop_front(attrName.size());
-        int comp = -1;
-        if (suffix == ".x")
-          comp = 0;
-        else if (suffix == ".y")
-          comp = 1;
-        else if (suffix == ".z")
-          comp = 2;
-        if (comp < 0)
-          continue;
-
-        auto it = nameToIdx.find(attrName);
-        if (it == nameToIdx.end()) {
-          nameToIdx[attrName] = result.size();
-          result.push_back({attrName, 0, {}});
-          it = nameToIdx.find(attrName);
-        }
-        result[it->second].calls[comp].push_back(CI);
-        break;
-      }
-    }
-  }
-}
-
-// Rewrite a kernel's LLVM Function to append <3 x i32> parameters for each
-// Metal attribute that was called.  Returns the new Function (or the
-// original if no injection was needed).
-static llvm::Function *
-injectAttrParams(llvm::Function *oldF,
-                 llvm::SmallVector<InjectedAttr> &attrs,
-                 llvm::LLVMContext &ctx) {
-  if (attrs.empty())
-    return oldF;
-
-  auto *i32Ty = llvm::Type::getInt32Ty(ctx);
-  auto *vec3Ty = llvm::FixedVectorType::get(i32Ty, 3);
-
-  // New parameter type list = original params + one <3 x i32> per attribute.
-  llvm::SmallVector<llvm::Type *, 8> newParamTypes;
-  for (auto &arg : oldF->args())
-    newParamTypes.push_back(arg.getType());
-
-  unsigned firstNew = oldF->arg_size();
-  for (unsigned i = 0; i < attrs.size(); ++i) {
-    attrs[i].paramIdx = firstNew + i;
-    newParamTypes.push_back(vec3Ty);
-  }
-
-  auto *newFTy =
-      llvm::FunctionType::get(oldF->getReturnType(), newParamTypes, false);
-  auto *newF = llvm::Function::Create(newFTy, oldF->getLinkage(), "",
-                                      oldF->getParent());
-  newF->takeName(oldF);
-  newF->copyAttributesFrom(oldF);
-
-  // Move basic blocks from old → new (cheap pointer splice).
-  newF->splice(newF->begin(), oldF);
-
-  // Remap old arguments → corresponding new arguments.
-  {
-    auto newArgIt = newF->arg_begin();
-    for (auto &oldArg : oldF->args()) {
-      newArgIt->takeName(&oldArg);
-      oldArg.replaceAllUsesWith(&*newArgIt);
-      ++newArgIt;
-    }
-  }
-
-  // Replace placeholder calls with extractelement from the injected params.
-  llvm::IRBuilder<> builder(ctx);
-  for (auto &attr : attrs) {
-    auto *param = newF->getArg(attr.paramIdx);
-    param->setName(attr.airName);
-
-    for (unsigned comp = 0; comp < 3; ++comp) {
-      for (auto *CI : attr.calls[comp]) {
-        builder.SetInsertPoint(CI);
-        auto *elem =
-            builder.CreateExtractElement(param, builder.getInt32(comp));
-        CI->replaceAllUsesWith(elem);
-        CI->eraseFromParent();
-      }
-    }
-  }
-
-  oldF->eraseFromParent();
-  return newF;
-}
-
-// Remove module-level declarations of placeholder functions that have no
-// remaining uses (all calls were replaced by extractelement).
-static void cleanupPlaceholderDecls(llvm::Module &mod) {
-  llvm::SmallVector<llvm::Function *, 16> toErase;
-  for (const auto &attrName : metalAttrNames) {
-    const char *suffixes[] = {".x", ".y", ".z"};
-    for (const char *sfx : suffixes) {
-      std::string name = (attrName.str() + sfx);
-      if (auto *F = mod.getFunction(name)) {
-        if (F->use_empty())
-          toErase.push_back(F);
-      }
-    }
-  }
-  for (auto *F : toErase)
-    F->eraseFromParent();
-}
 
 /// Match Apple Metal AIR kernel attributes (see e.g. MetalHello/hello.ll):
 /// `no-builtins`, fast-math strings, and `memory(argmem: write)` for typical
@@ -279,15 +128,19 @@ static void runMetalAIRCleanupPasses(llvm::Module &M) {
   FPM.addPass(llvm::DCEPass());
 
   llvm::ModulePassManager MPM;
+  MPM.addPass(llvm::ModuleInlinerWrapperPass());
   MPM.addPass(
       llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   MPM.addPass(llvm::GlobalDCEPass());
   MPM.run(M, MAM);
 
-  // InstCombine can mark `icmp` with SameSign (prints as `icmp samesign`;
-  // `ICmpInst::hasSameSign()` exists from LLVM 20). Apple's Metal stack can
-  // reject that bitcode encoding. Strip the flag when the LLVM API is
-  // available.
+  // InstCombine can emit newer LLVM IR flags that Apple's Metal stack can
+  // reject in bitcode/textual IR:
+  // - `icmp samesign` (LLVM 20+)
+  // - `zext nneg` (LLVM 20+)
+  // - explicit GEP no-wrap flags such as `nuw`
+  // Strip those while preserving older, Apple-accepted forms such as
+  // `getelementptr inbounds`.
 #if LDC_LLVM_VER >= 2000
   for (llvm::Function &F : M) {
     if (F.isDeclaration())
@@ -296,8 +149,23 @@ static void runMetalAIRCleanupPasses(llvm::Module &M) {
       llvm::SmallVector<llvm::ICmpInst *, 16> todo;
       for (llvm::Instruction &I : BB) {
         auto *icmp = llvm::dyn_cast<llvm::ICmpInst>(&I);
-        if (icmp && icmp->hasSameSign())
+        if (icmp && icmp->hasSameSign()) {
           todo.push_back(icmp);
+        }
+
+        if (auto *zext = llvm::dyn_cast<llvm::ZExtInst>(&I)) {
+          if (zext->hasNonNeg()) {
+            zext->setNonNeg(false);
+          }
+        }
+
+        if (auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(&I)) {
+          if (gep->getNoWrapFlags() != llvm::GEPNoWrapFlags::none()) {
+            gep->setNoWrapFlags(gep->isInBounds()
+                                    ? llvm::GEPNoWrapFlags::inBounds()
+                                    : llvm::GEPNoWrapFlags::none());
+          }
+        }
       }
       for (llvm::ICmpInst *icmp : todo) {
         llvm::IRBuilder<> b(icmp);
@@ -313,8 +181,14 @@ static void runMetalAIRCleanupPasses(llvm::Module &M) {
 #endif // LDC_LLVM_VER >= 2000
 }
 
-/// Remove uninlined device helpers (e.g. `GlobalIndex.x` templates) so
-/// `cleanupPlaceholderDecls` can drop unused `declare @air.*` lines.
+/// Drop leftover helper definitions after inlining.
+///
+/// D template helpers from `dcompute.std` are emitted as `weak_odr` functions.
+/// LLVM's GlobalDCE keeps unused externally visible definitions because a normal
+/// object-file link may still need them. A Metal AIR module is different: the
+/// only definitions that should remain externally visible are kernel entry
+/// points. Other unused definitions are just inlined device helpers and can
+/// confuse the AIR output, so remove them once all kernel bodies are finalized.
 static void eraseUnusedNonKernelFunctions(
     llvm::Module &M, llvm::ArrayRef<llvm::Function *> keepKernels) {
   llvm::SmallPtrSet<llvm::Function *, 8> keep(keepKernels.begin(),
@@ -394,16 +268,10 @@ public:
   // ── Write .air bitcode file ───────────────────────────────────────────
 
   void writeModule() override {
-    // Step 1: Inline functions that (transitively) call Metal attribute
-    // placeholders like @air.thread_position_in_grid.x into kernel bodies.
-    inlineMetalPlaceholderCallers();
-
-    // Step 2: For each kernel, detect placeholder calls and inject
-    // <3 x i32> parameters for each Metal attribute actually used.
+    // Step 1: Collect kernel functions for metadata and cleanup.
     struct KernelInfo {
       FuncDeclaration *fd;
       llvm::Function *fn;
-      llvm::SmallVector<InjectedAttr> attrs;
     };
     llvm::SmallVector<KernelInfo, 4> kernels;
 
@@ -412,15 +280,10 @@ public:
       if (!fn)
         continue;
 
-      llvm::SmallVector<InjectedAttr> attrs;
-      collectAttrCalls(fn, attrs);
-      fn = injectAttrParams(fn, attrs, ctx);
-      kernels.push_back({rec.fd, fn, std::move(attrs)});
+      kernels.push_back({rec.fd, fn});
     }
 
-    cleanupPlaceholderDecls(_ir->module);
-
-    // Step 3: Rename kernel functions to clean names.
+    // Step 2: Rename kernel functions to clean names.
     // Metal's host API (newFunctionWithName:) looks up kernels by name, so
     // we must strip D mangling.  Use pragma(mangle, ...) override if the
     // user set one, otherwise fall back to the D identifier.
@@ -438,14 +301,14 @@ public:
       ki.fn->setName(cleanName);
     }
 
-    // Step 4: Emit module-level metadata.
+    // Step 3: Emit module-level metadata.
     addMetadata();
 
-    // Step 5: Emit per-kernel metadata (now aware of injected attr params).
+    // Step 4: Emit per-kernel metadata.
     for (auto &ki : kernels)
-      emitKernelMD(ki.fd, ki.fn, ki.attrs);
+      emitKernelMD(ki.fd, ki.fn);
 
-    // Step 6: Kernel function attributes + IR cleanup (Apple AIR parity).
+    // Step 5: Kernel function attributes + IR cleanup (Apple AIR parity).
     llvm::SmallVector<llvm::Function *, 4> kernelFns;
     for (auto &ki : kernels)
       kernelFns.push_back(ki.fn);
@@ -453,9 +316,8 @@ public:
       applyMetalKernelAttributes(ctx, kf);
     runMetalAIRCleanupPasses(_ir->module);
     eraseUnusedNonKernelFunctions(_ir->module, kernelFns);
-    cleanupPlaceholderDecls(_ir->module);
 
-    // Step 7: Build output path.
+    // Step 6: Build output path.
     std::string filename;
     llvm::raw_string_ostream os(filename);
     os << opts::dcomputeFilePrefix << '_' << short_name << tversion
@@ -464,7 +326,7 @@ public:
     const char *outPath =
         FileName::combine(global.params.objdir.ptr, os.str().c_str());
 
-    // Step 8: Verify the module before writing.
+    // Step 7: Verify the module before writing.
     if (llvm::verifyModule(_ir->module, &llvm::errs())) {
       error(Loc(), "Metal AIR module verification failed");
       fatal();
@@ -518,65 +380,6 @@ private:
     const char *mangledName;
   };
   llvm::SmallVector<KernelRecord, 4> pendingKernels_;
-
-  // ── Inline functions that transitively call Metal attribute placeholders ──
-
-  void inlineMetalPlaceholderCallers() {
-    // Mark any function that directly calls an air.* placeholder as
-    // alwaysinline so the AlwaysInlinerPass will fold it into callers.
-    // Repeat until no new functions are marked (handles transitive chains).
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      for (auto &F : _ir->module) {
-        if (F.isDeclaration() || F.hasFnAttribute(llvm::Attribute::AlwaysInline))
-          continue;
-        for (auto &BB : F) {
-          for (auto &I : BB) {
-            auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
-            if (!CI || !CI->getCalledFunction())
-              continue;
-            llvm::StringRef name = CI->getCalledFunction()->getName();
-            bool isPlaceholder = false;
-            for (const auto &attrName : metalAttrNames) {
-              if (name.starts_with(attrName)) {
-                isPlaceholder = true;
-                break;
-              }
-            }
-            // Also treat calls to already-marked alwaysinline functions
-            // as needing propagation.
-            if (isPlaceholder ||
-                (CI->getCalledFunction()->hasFnAttribute(
-                    llvm::Attribute::AlwaysInline) &&
-                 !CI->getCalledFunction()->isDeclaration())) {
-              F.addFnAttr(llvm::Attribute::AlwaysInline);
-              changed = true;
-              goto next_function;
-            }
-          }
-        }
-      next_function:;
-      }
-    }
-
-    // Now run AlwaysInlinerPass to actually inline them.
-    llvm::LoopAnalysisManager lam;
-    llvm::FunctionAnalysisManager fam;
-    llvm::CGSCCAnalysisManager cgam;
-    llvm::ModuleAnalysisManager mam;
-
-    llvm::PassBuilder pb;
-    pb.registerModuleAnalyses(mam);
-    pb.registerFunctionAnalyses(fam);
-    pb.registerLoopAnalyses(lam);
-    pb.registerCGSCCAnalyses(cgam);
-    pb.crossRegisterProxies(lam, fam, cgam, mam);
-
-    llvm::ModulePassManager mpm;
-    mpm.addPass(llvm::AlwaysInlinerPass());
-    mpm.run(_ir->module, mam);
-  }
 
   // ── Module flags (matches hello.ll !llvm.module.flags) ────────────────
 
@@ -658,10 +461,9 @@ private:
         ctx, {llvm::MDString::get(ctx, "LDC DCompute Metal (AIR)")}));
   }
 
-  // ── Per-kernel metadata emission (after attribute injection) ──────────
+  // ── Per-kernel metadata emission ──────────────────────────────────────
 
-  void emitKernelMD(FuncDeclaration *fd, llvm::Function *llf,
-                    const llvm::SmallVector<InjectedAttr> &injected) {
+  void emitKernelMD(FuncDeclaration *fd, llvm::Function *llf) {
     llvm::NamedMDNode *airKernel =
         _ir->module.getOrInsertNamedMetadata("air.kernel");
 
@@ -710,12 +512,6 @@ private:
       }
     }
 
-    // Injected Metal attribute parameters.
-    for (const auto &attr : injected) {
-      inputArgs.push_back(buildAttrParamMD(attr));
-      llf->addParamAttr(attr.paramIdx, llvm::Attribute::NoUndef);
-    }
-
     llvm::Metadata *outputsMD = llvm::MDTuple::get(ctx, {});
     llvm::Metadata *inputsMD  = llvm::MDTuple::get(ctx, inputArgs);
 
@@ -724,26 +520,6 @@ private:
         outputsMD,
         inputsMD};
     airKernel->addOperand(llvm::MDTuple::get(ctx, entry));
-  }
-
-  // ── Build metadata for an injected Metal attribute parameter ──────────
-  //
-  // Apple's format:
-  //   !{i32 <paramIdx>, !"<air_attr_name>",
-  //    !"air.arg_type_name", !"uint3", !"air.arg_name", !"<name>"}
-
-  llvm::Metadata *buildAttrParamMD(const InjectedAttr &attr) {
-    auto *i32Ty = llvm::Type::getInt32Ty(ctx);
-    auto ms = [&](llvm::StringRef s) -> llvm::Metadata * {
-      return llvm::MDString::get(ctx, s);
-    };
-    llvm::Metadata *fields[] = {
-        llvm::ConstantAsMetadata::get(
-            llvm::ConstantInt::get(i32Ty, attr.paramIdx)),
-        ms(attr.airName),
-        ms("air.arg_type_name"), ms("uint3"),
-        ms("air.arg_name"),      ms(attr.airName)};
-    return llvm::MDTuple::get(ctx, fields);
   }
 
   // ── Build per-parameter AIR metadata nodes ────────────────────────────
