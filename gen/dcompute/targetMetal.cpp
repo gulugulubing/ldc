@@ -20,9 +20,10 @@
 //   AIR's dimension-taking intrinsics (`air.get_global_id.i32(0)` etc.).
 //   No synthetic kernel parameters or index metadata are needed.
 //
-// After emission, kernel functions get Apple-style fnattrs, then SROA /
-// mem2reg / instcombine / DCE (+ dead helper removal) so IR resembles
-// Metal-generated kernels; see docs/dcompute-metal-progress.md.
+// After emission, kernel functions get Apple-style fnattrs, then a small LLVM
+// cleanup pipeline (module inliner, SROA / mem2reg / instcombine / DCE,
+// GlobalDCE), Apple bitcode compatibility fixes, and removal of dead non-kernel
+// helpers so IR resembles Metal-generated kernels;
 //
 //===----------------------------------------------------------------------===//
 
@@ -106,8 +107,16 @@ static void applyMetalKernelAttributes(llvm::LLVMContext &C, llvm::Function *F) 
     F->removeFnAttr(llvm::Attribute::AlwaysInline);
 }
 
-/// SROA + mem2reg + instcombine + DCE to drop `GlobalPointer` alloca wrappers
-/// and approach SSA like Apple-generated kernels.
+/// Run a narrow LLVM cleanup pipeline on the AIR module.
+///
+/// Order: `ModuleInlinerWrapperPass` (cost-based inlining), then per-function
+/// SROA / mem2reg / instcombine / DCE, then `GlobalDCE`. That tends to fold
+/// small `dcompute.std` helpers into kernels, promote stack-like patterns to SSA,
+/// and drop obvious dead code. This is not the full `ldc_optimize_module` path
+/// used for host/CUDA/SPIR-V output; Metal AIR is fed to Apple's toolchain and
+/// needs a conservative, AIR-friendly pass set. On LLVM 20+, a final walk strips
+/// newer instruction flags (e.g. `icmp samesign`, `zext nneg`) that Apple’s
+/// Metal stack rejects when ingesting our IR.
 static void runMetalAIRCleanupPasses(llvm::Module &M) {
   llvm::LoopAnalysisManager LAM;
   llvm::FunctionAnalysisManager FAM;
@@ -135,7 +144,8 @@ static void runMetalAIRCleanupPasses(llvm::Module &M) {
   MPM.run(M, MAM);
 
   // InstCombine can emit newer LLVM IR flags that Apple's Metal stack can
-  // reject in bitcode/textual IR:
+  // (`xcrun metallib` for AIR bitcode, and `xcrun metal -x ir` for textual IR)
+  // reject before producing a `.metallib`:
   // - `icmp samesign` (LLVM 20+)
   // - `zext nneg` (LLVM 20+)
   // - explicit GEP no-wrap flags such as `nuw`
@@ -260,9 +270,9 @@ public:
 
   // ── Per-kernel registration (deferred — metadata is emitted later) ────
 
-  void addKernelMetadata(FuncDeclaration *fd, llvm::Function * /*llf*/,
+  void addKernelMetadata(FuncDeclaration *fd, llvm::Function *llf,
                          StructLiteralExp * /*kernAttr*/) override {
-    pendingKernels_.push_back({fd, fd->mangleString});
+    pendingKernels_.push_back({fd, llf});
   }
 
   // ── Write .air bitcode file ───────────────────────────────────────────
@@ -276,29 +286,17 @@ public:
     llvm::SmallVector<KernelInfo, 4> kernels;
 
     for (auto &rec : pendingKernels_) {
-      auto *fn = _ir->module.getFunction(rec.mangledName);
-      if (!fn)
+      if (!rec.fn)
         continue;
 
-      kernels.push_back({rec.fd, fn});
+      kernels.push_back({rec.fd, rec.fn});
     }
 
-    // Step 2: Rename kernel functions to clean names.
+    // Step 2: Rename kernel functions to their plain D names.
     // Metal's host API (newFunctionWithName:) looks up kernels by name, so
-    // we must strip D mangling.  Use pragma(mangle, ...) override if the
-    // user set one, otherwise fall back to the D identifier.
+    // expose `void mmul(...)` as `mmul` instead of the D-mangled symbol.
     for (auto &ki : kernels) {
-      llvm::StringRef cleanName;
-      std::string overrideBuf;
-
-      if (ki.fd->mangleOverride.length) {
-        overrideBuf.assign(ki.fd->mangleOverride.ptr,
-                           ki.fd->mangleOverride.length);
-        cleanName = overrideBuf;
-      } else {
-        cleanName = ki.fd->ident->toChars();
-      }
-      ki.fn->setName(cleanName);
+      ki.fn->setName(ki.fd->ident->toChars());
     }
 
     // Step 3: Emit module-level metadata.
@@ -377,7 +375,7 @@ public:
 private:
   struct KernelRecord {
     FuncDeclaration *fd;
-    const char *mangledName;
+    llvm::Function *fn;
   };
   llvm::SmallVector<KernelRecord, 4> pendingKernels_;
 
