@@ -61,6 +61,7 @@
 #include "llvm/Transforms/IPO/Inliner.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar/DCE.h"
+#include "llvm/Transforms/Scalar/LICM.h"
 #include "llvm/Transforms/Scalar/SROA.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
 
@@ -109,14 +110,17 @@ static void applyMetalKernelAttributes(llvm::LLVMContext &C, llvm::Function *F) 
 
 /// Run a narrow LLVM cleanup pipeline on the AIR module.
 ///
-/// Order: `ModuleInlinerWrapperPass` (cost-based inlining), then per-function
-/// SROA / mem2reg / instcombine / DCE, then `GlobalDCE`. That tends to fold
-/// small `dcompute.std` helpers into kernels, promote stack-like patterns to SSA,
-/// and drop obvious dead code. This is not the full `ldc_optimize_module` path
-/// used for host/CUDA/SPIR-V output; Metal AIR is fed to Apple's toolchain and
-/// needs a conservative, AIR-friendly pass set. On LLVM 20+, a final walk strips
-/// newer instruction flags (e.g. `icmp samesign`, `zext nneg`) that Apple’s
-/// Metal stack rejects when ingesting our IR.
+/// Execution order: first `ModuleInlinerWrapperPass` (cost-based inlining),
+/// then a function-pass adaptor running SROA / mem2reg / instcombine / LICM /
+/// DCE for each function, then `GlobalDCE`. That tends to fold small
+/// `dcompute.std` helpers into kernels, promote stack-like patterns to SSA,
+/// hoist loop-invariant address math, and drop obvious dead code. This is not
+/// the full `ldc_optimize_module` path used for host/CUDA output. Like SPIR-V,
+/// Metal AIR is ultimately optimized by the consumer toolchain; this small pass
+/// set is only for AIR-friendly cleanup before handing bitcode to Apple's Metal
+/// compiler tools. On LLVM 20+, a final walk strips newer IR constructs (e.g.
+/// `icmp samesign`, `zext nneg`, GEP no-wrap flags) that those tools reject
+/// when ingesting our IR.
 static void runMetalAIRCleanupPasses(llvm::Module &M) {
   llvm::LoopAnalysisManager LAM;
   llvm::FunctionAnalysisManager FAM;
@@ -134,6 +138,8 @@ static void runMetalAIRCleanupPasses(llvm::Module &M) {
   FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
   FPM.addPass(llvm::PromotePass());
   FPM.addPass(llvm::InstCombinePass());
+  FPM.addPass(llvm::createFunctionToLoopPassAdaptor(
+      llvm::LICMPass(128, 128, false), /*UseMemorySSA=*/true));
   FPM.addPass(llvm::DCEPass());
 
   llvm::ModulePassManager MPM;
@@ -143,12 +149,12 @@ static void runMetalAIRCleanupPasses(llvm::Module &M) {
   MPM.addPass(llvm::GlobalDCEPass());
   MPM.run(M, MAM);
 
-  // InstCombine can emit newer LLVM IR flags that Apple's Metal stack can
-  // (`xcrun metallib` for AIR bitcode, and `xcrun metal -x ir` for textual IR)
-  // reject before producing a `.metallib`:
+  // InstCombine can emit newer LLVM IR constructs that Apple's Metal compiler
+  // tools reject before producing a `.metallib` (`xcrun metallib` for AIR
+  // bitcode, and `xcrun metal -x ir` for textual IR):
   // - `icmp samesign` (LLVM 20+)
   // - `zext nneg` (LLVM 20+)
-  // - explicit GEP no-wrap flags such as `nuw`
+  // - explicit GEP no-wrap flags such as `nuw` (not arithmetic `nuw`/`nsw`)
   // Strip those while preserving older, Apple-accepted forms such as
   // `getelementptr inbounds`.
 #if LDC_LLVM_VER >= 2000

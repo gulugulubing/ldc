@@ -570,7 +570,8 @@ bool ldc_optimize_module(llvm::Module *M, llvm::TargetMachine *TM) {
   if (getComputeTargetType(M) == ComputeBackend::SPIRV)
     return false;
   // AIR modules are emitted as LLVM bitcode; Apple's metallib handles
-  // final optimization.  Skip LLVM machine-level passes here.
+  // final optimization.  Skip LLVM machine-level passes here and some optimizations
+  // are handled by targetMetal.cpp
   if (getComputeTargetType(M) == ComputeBackend::AIR)
     return false;
 #endif
