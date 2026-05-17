@@ -18,6 +18,7 @@ using namespace dmd;
 
 struct AirTargetABI : TargetABI {
   DComputePointerRewrite pointerRewite;
+  DComputeConstantScalarRewrite constantScalarRewrite;
 
   llvm::CallingConv::ID callingConv(LINK l) override {
     assert(l == LINK::c);
@@ -42,7 +43,24 @@ struct AirTargetABI : TargetABI {
       return false;
   }
 
+  void rewriteFunctionType(IrFuncTy &fty) override {
+    const bool isKernel =
+        fty.tag && getKernelAttr(static_cast<FuncDeclaration *>(fty.tag));
+    if (!skipReturnValueRewrite(fty))
+      rewriteArgumentForFunction(fty, *fty.ret, false);
+
+    for (auto arg : fty.args) {
+      if (!arg->byref)
+        rewriteArgumentForFunction(fty, *arg, isKernel);
+    }
+  }
+
   void rewriteArgument(IrFuncTy &fty, IrFuncTyArg &arg) override {
+    rewriteArgumentForFunction(fty, arg, false);
+  }
+
+  void rewriteArgumentForFunction(IrFuncTy &fty, IrFuncTyArg &arg,
+                                  bool isKernelParam) {
     TargetABI::rewriteArgument(fty, arg);
     if (arg.rewrite)
       return;
@@ -53,6 +71,9 @@ struct AirTargetABI : TargetABI {
         (ptr = toDcomputePointer(static_cast<TypeStruct *>(ty)->sym))) {
       pointerRewite.applyTo(arg);
       arg.attrs.addAttribute("air-buffer-no-alias");
+    } else if (isKernelParam && ty->isTypeBasic() &&
+               (ty->isIntegral() || ty->isFloating())) {
+      constantScalarRewrite.applyTo(arg);
     }
   }
 };

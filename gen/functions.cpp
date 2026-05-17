@@ -239,7 +239,19 @@ llvm::FunctionType *DtoFunctionType(Type *type, IrFuncTy &irFty, Type *thistype,
     ++nextLLArgIdx;
   }
 
-  // let the ABI rewrite the types as necessary
+  // Let the ABI rewrite the types as necessary.
+  //
+  // Metal AIR needs one bit of declaration context while rewriting a function
+  // type: scalar parameters of @kernel entry points are host-bound argument
+  // slots and must be lowered as constant-address-space pointers, while scalar
+  // parameters of ordinary device/helper functions should remain by-value.
+  // `IrFuncTy` normally only carries the TypeFunction, so stash the declaration
+  // in its ABI-specific `tag` field for the AIR ABI to inspect.
+  if (fd && gIR->dcomputetarget &&
+      gIR->dcomputetarget->target == DComputeTarget::ID::Metal &&
+      getKernelAttr(fd)) {
+    newIrFty.tag = fd;
+  }
   abi->rewriteFunctionType(newIrFty);
 
   // Now we can modify irFty safely.

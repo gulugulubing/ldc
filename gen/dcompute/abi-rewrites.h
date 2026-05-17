@@ -33,3 +33,20 @@ struct DComputePointerRewrite : ABIRewrite {
     return ptr->toLLVMType(true);
   }
 };
+
+struct DComputeConstantScalarRewrite : ABIRewrite {
+  LLValue *put(DValue *v, bool, bool) override {
+    // Kernel entry points are launched by the host, so this is not expected to
+    // be used for normal device calls.
+    return getAddressOf(v);
+  }
+
+  LLValue *getLVal(Type *dty, LLValue *v) override {
+    LLValue *mem =
+        DtoAlloca(dty, ".DComputeConstantScalarRewrite_param_storage");
+    DtoStore(DtoLoad(DtoType(dty), v), mem);
+    return mem;
+  }
+
+  LLType *type(Type *) override { return getOpaquePtrType(2); }
+};
