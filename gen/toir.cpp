@@ -2113,10 +2113,12 @@ public:
     PGO.setCurrentStmt(e);
 
     Type *dtype = e->type->toBasetype();
+    const bool isLvalueCond = e->isLvalue();
     LLValue *retPtr = nullptr;
     if (!(dtype->ty == TY::Tvoid || dtype->ty == TY::Tnoreturn)) {
-      // allocate a temporary for pointer to the final result.
-      retPtr = DtoAlloca(pointerTo(dtype), "condtmp");
+      // Lvalue `(a?x:y)=z` stores branch lvalue addresses; rvalue `a?b:c`
+      // stores branch values (device loads happen in each branch, not on reload).
+      retPtr = DtoAlloca(isLvalueCond ? pointerTo(dtype) : dtype, "condtmp");
     }
 
     llvm::BasicBlock *condtrue = p->insertBB("condtrue");
@@ -2135,22 +2137,32 @@ public:
     PGO.emitCounterIncrement(e);
     DValue *u = toElem(e->e1);
     if (retPtr && u->type->toBasetype()->ty != TY::Tnoreturn) {
-      LLValue *lval = makeLValue(e->loc, u);
-      DtoStore(lval, retPtr);
+      if (isLvalueCond) {
+        LLValue *lval = makeLValue(e->loc, u);
+        DtoStore(lval, retPtr);
+      } else {
+        DtoAssign(e->loc, new DLValue(e->type, retPtr), u, EXP::blit);
+      }
     }
     llvm::BranchInst::Create(condend, p->scopebb());
 
     p->ir->SetInsertPoint(condfalse);
     DValue *v = toElem(e->e2);
     if (retPtr && v->type->toBasetype()->ty != TY::Tnoreturn) {
-      LLValue *lval = makeLValue(e->loc, v);
-      DtoStore(lval, retPtr);
+      if (isLvalueCond) {
+        LLValue *lval = makeLValue(e->loc, v);
+        DtoStore(lval, retPtr);
+      } else {
+        DtoAssign(e->loc, new DLValue(e->type, retPtr), v, EXP::blit);
+      }
     }
     llvm::BranchInst::Create(condend, p->scopebb());
 
     p->ir->SetInsertPoint(condend);
-    if (retPtr)
-      result = new DSpecialRefValue(e->type, retPtr);
+    if (retPtr) {
+      result = isLvalueCond ? static_cast<DValue *>(new DSpecialRefValue(e->type, retPtr))
+                            : static_cast<DValue *>(new DLValue(e->type, retPtr));
+    }
   }
 
   //////////////////////////////////////////////////////////////////////////////

@@ -121,7 +121,13 @@ static void applyMetalKernelAttributes(llvm::LLVMContext &C, llvm::Function *F) 
 /// compiler tools. On LLVM 20+, a final walk strips newer IR constructs (e.g.
 /// `icmp samesign`, `zext nneg`, GEP no-wrap flags) that those tools reject
 /// when ingesting our IR.
+/// TEMP DEBUG: set to true to skip SROA/mem2reg and see raw CondExp alloca/stores
+/// in .air.ll. Revert before committing.
+static constexpr bool kSkipMetalAIRCleanupForDebug = false;
+
 static void runMetalAIRCleanupPasses(llvm::Module &M) {
+  if (kSkipMetalAIRCleanupForDebug)
+    return;
   llvm::LoopAnalysisManager LAM;
   llvm::FunctionAnalysisManager FAM;
   llvm::CGSCCAnalysisManager CGAM;
