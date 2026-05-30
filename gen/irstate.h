@@ -94,9 +94,6 @@ struct IRAsmBlock {
   std::set<std::string> clobs;
   size_t outputcount;
 
-  // stores the labels within the asm block
-  std::vector<Identifier *> internalLabels;
-
   CompoundAsmStatement *asmBlock;
   LLType *retty;
   unsigned retn;
@@ -156,7 +153,7 @@ public:
   IrFunction *func();
   llvm::Function *topfunc();
 
-#if LDC_LLVM_VER >= 1900
+#if LLVM_VERSION_MAJOR >= 19
   llvm::BasicBlock::iterator nextAllocaPos();
 #else
   llvm::BasicBlock *nextAllocaPos();
@@ -220,7 +217,6 @@ public:
 
   // for inline asm
   IRAsmBlock *asmBlock = nullptr;
-  std::ostringstream nakedAsm;
 
   // Globals to pin in the llvm.used array to make sure they are not
   // eliminated.

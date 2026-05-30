@@ -92,6 +92,9 @@ struct DComputeSemanticAnalyser : public StoppableVisitor {
       return;
     }
 
+    if (!decl->type)
+      return;
+
     if (decl->type->ty == TY::Taarray) {
       error(decl->loc, "associative arrays not allowed in `@compute` code");
       stop = true;
@@ -209,6 +212,11 @@ struct DComputeSemanticAnalyser : public StoppableVisitor {
     }
   }
   void visit(CallExp *e) override {
+    // Indirect calls via function pointers / delegates have no associated
+    // FuncDeclaration, so there is no module to check.
+    if (!e->f)
+      return;
+
     // SynchronizedStatement is lowered to
     //    Critsec __critsec105; // 105 == line number
     //    _d_criticalenter(& __critsec105); <--
@@ -226,9 +234,15 @@ struct DComputeSemanticAnalyser : public StoppableVisitor {
       stop = true;
       return;
     }
-      
+
     Module *m = e->f->getModule();
-    if ((m == nullptr || (hasComputeAttr(m) == DComputeCompileFor::hostOnly)) &&
+    // Template-instantiated functions are cross-module by nature: the template
+    // declaration and the instantiated function live in different modules.
+    // getModule() returns the *declaration* module, which says nothing about
+    // whether the generated code can run on GPU. Skip the module check for them.
+    const bool isTemplateFunc = e->f->isInstantiated() != nullptr;
+    if (!isTemplateFunc &&
+        (m == nullptr || (hasComputeAttr(m) == DComputeCompileFor::hostOnly)) &&
         !isNonComputeCallExpVaild(e)) {
       error(e->loc, "can only call functions from other `@compute` modules in "
                     "`@compute` code");

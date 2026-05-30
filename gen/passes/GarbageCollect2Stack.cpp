@@ -24,7 +24,7 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSwitch.h"
-#if LDC_LLVM_VER >= 2100
+#if LLVM_VERSION_MAJOR >= 21
 #include "llvm/IR/AbstractCallSite.h"
 #endif
 #include "llvm/IR/Constants.h"
@@ -100,7 +100,7 @@ Value* FunctionInfo::promote(CallBase *CB, IRBuilder<> &B, const G2StackAnalysis
   // FIXME: set alignment on alloca?
   return new AllocaInst(
       Ty, BB.getModule()->getDataLayout().getAllocaAddrSpace(), ".nongc_mem",
-#if LDC_LLVM_VER >= 1900
+#if LLVM_VERSION_MAJOR >= 19
       BB.begin()
 #else
       &(*BB.begin())
@@ -351,19 +351,19 @@ static void RemoveCall(CallBase *CB, const G2StackAnalysis &A) {
   // immediately before it. Ideally, we would find a way to not invalidate
   // the dominator tree here.
   if (auto Invoke = dyn_cast<InvokeInst>(static_cast<Instruction *>(CB))) {
-    BranchInst::Create(Invoke->getNormalDest(),
-#if LDC_LLVM_VER >= 1900
-                       Invoke->getIterator()
+#if   LLVM_VERSION_MAJOR >= 23
+    UncondBrInst::Create(Invoke->getNormalDest(), Invoke->getIterator());
+#elif LLVM_VERSION_MAJOR >= 19
+    BranchInst::Create(Invoke->getNormalDest(), Invoke->getIterator());
 #else
-                       Invoke
+    BranchInst::Create(Invoke->getNormalDest(), Invoke);
 #endif
-    );
     Invoke->getUnwindDest()->removePredecessor(CB->getParent());
   }
 
   // Remove the runtime call.
   if (A.CGNode) {
-#if LDC_LLVM_VER >= 2100
+#if LLVM_VERSION_MAJOR >= 21
     //FIXME: Look into using `LazyCallGraph` and the new pass manager
     for (auto I = A.CGNode->begin(); ; I++) {
       assert(I != A.CGNode->end() && "Cannot find callsite to remove!");
@@ -611,7 +611,11 @@ static bool mayBeUsedAfterRealloc(Instruction *Def, BasicBlock::iterator Alloc,
 
     // All instructions after the starting point in this block have been
     // accounted for. Look for successors to add to the work list.
+#if LLVM_VERSION_MAJOR >= 23
+    auto *Term = B->getTerminatorOrNull();
+#else
     auto *Term = B->getTerminator();
+#endif
     unsigned SuccCount = Term->getNumSuccessors();
     for (unsigned i = 0; i < SuccCount; i++) {
       BasicBlock *Succ = Term->getSuccessor(i);
@@ -755,7 +759,7 @@ bool isSafeToStackAllocate(BasicBlock::iterator Alloc, Value *V,
       auto B = CB->arg_begin(), E = CB->arg_end();
       for (auto A = B; A != E; ++A) {
         if (A->get() == V) {
-#if LDC_LLVM_VER >= 2100
+#if LLVM_VERSION_MAJOR >= 21
           if (!(CB->paramHasAttr(A - B, llvm::Attribute::AttrKind::Captures) &&
                 capturesNothing(
                     CB->getParamAttr(A - B, llvm::Attribute::AttrKind::Captures)

@@ -36,7 +36,6 @@ find_package(LLVM 18.0 REQUIRED
     mcdisassembler mcparser objcarcopts object option profiledata scalaropts
     selectiondag support tablegen target transformutils vectorize
     windowsdriver windowsmanifest symbolize ${EXTRA_LLVM_MODULES})
-math(EXPR LDC_LLVM_VER ${LLVM_VERSION_MAJOR}*100+${LLVM_VERSION_MINOR})
 message(STATUS "Using LLVM Version ${LLVM_VERSION_MAJOR}.${LLVM_VERSION_MINOR}")
 # Remove LLVMTableGen library from list of libraries
 string(REGEX MATCH "[^;]*LLVMTableGen[^;]*" LLVM_TABLEGEN_LIBRARY "${LLVM_LIBRARIES}")
@@ -50,7 +49,7 @@ add_definitions("-DLDC_LLVM_SUPPORTED_TARGET_METAL=1")
 
 # Set MLIR support variables if it is found.
 # FIXME: LLVM 14+ (`mlir::OwningModuleRef` replacement)
-if(NOT LDC_WITH_MLIR STREQUAL "OFF" AND LDC_LLVM_VER LESS 1400)
+if(NOT LDC_WITH_MLIR STREQUAL "OFF" AND LLVM_VERSION_MAJOR LESS 14)
     include(FindMLIR)
     if(MLIR_FOUND)
         message(STATUS "-- Building LDC with MLIR support (${MLIR_ROOT_DIR})")
@@ -98,6 +97,9 @@ set(ALTERNATIVE_MALLOC_O   ""     CACHE STRING "If specified, adds ALTERNATIVE_M
 # Most linux distributions have a policy of not bundling dependencies like zlib
 set(PHOBOS_SYSTEM_ZLIB OFF CACHE BOOL "Use system zlib instead of Phobos' vendored version")
 
+# Force use of softfloat for compiler
+option(LDC_FORCE_SOFTFLOAT_REAL "Force LDC to be built with 80-bit real in software" OFF)
+
 if(D_VERSION EQUAL 1)
     message(FATAL_ERROR "D version 1 is no longer supported.
 Please consider using D version 2 or checkout the 'd1' git branch for the last version supporting D version 1.")
@@ -136,6 +138,7 @@ if(NOT MSVC_IDE)
 endif()
 
 if(MSVC)
+    set(LDC_FORCE_SOFTFLOAT_REAL ON)
     if(CMAKE_SIZEOF_VOID_P EQUAL 8)
         message(STATUS "Let D host compiler output 64-bit object files")
         append("-m64" DFLAGS_BASE)
@@ -165,6 +168,11 @@ if(MSVC)
             string(REGEX REPLACE "/Ob[0-2]" "${llvm_ob_flag}" ${flag_var} "${${flag_var}}")
         endif()
     endforeach()
+endif()
+
+if (LDC_FORCE_SOFTFLOAT_REAL)
+    append("-version=LDC_real_softfloat" DFLAGS_LDC)
+    append("-DLDC_real_softfloat" LDC_CXXFLAGS)
 endif()
 
 # Use separate compiler flags for the frontend and for the LDC-specific parts,
@@ -397,7 +405,7 @@ set(LDC_DYNAMIC_COMPILE "AUTO" CACHE STRING "Support dynamic compilation (ON|OFF
 option(LDC_DYNAMIC_COMPILE_USE_CUSTOM_PASSES "Use custom LDC passes in jit" ON)
 if(LDC_DYNAMIC_COMPILE STREQUAL "AUTO")
     # FIXME: dynamic-compile regressions with LLVM 20
-    if(LDC_LLVM_VER LESS 2000)
+    if(LLVM_VERSION_MAJOR LESS 20)
         set(LDC_DYNAMIC_COMPILE ON)
     else()
         set(LDC_DYNAMIC_COMPILE OFF)
@@ -434,13 +442,11 @@ append("-J${PROJECT_SOURCE_DIR}/dmd/res" DFLAGS_LDC)
 
 append("-version=IN_LLVM" DFLAGS_LDC)
 append("-DIN_LLVM" LDC_CXXFLAGS)
-append("-DOPAQUE_VTBLS" LDC_CXXFLAGS)
 # Predefine LDC_INSTALL_PREFIX as raw string literal, requiring shell + CMake escaping.
 # E.g., for CMAKE_INSTALL_PREFIX=`C:\dir with space`:
 #   g++ "-DLDC_INSTALL_PREFIX=R\"(C:\dir with space)\"" ...
 #   => LDC_INSTALL_PREFIX defined as `R"(C:\dir with space)"`
 append("\"-DLDC_INSTALL_PREFIX=R\\\"(${CMAKE_INSTALL_PREFIX})\\\"\"" LDC_CXXFLAGS)
-append("-DLDC_LLVM_VER=${LDC_LLVM_VER}" LDC_CXXFLAGS)
 append("\"-DLDC_LIBDIR_SUFFIX=R\\\"(${LIB_SUFFIX})\\\"\"" LDC_CXXFLAGS)
 append("-DLDC_HOST_${D_COMPILER_ID}=1" LDC_CXXFLAGS)
 append("-DLDC_HOST_FE_VER=${D_COMPILER_FE_VERSION}" LDC_CXXFLAGS)
@@ -557,19 +563,17 @@ if(MSVC)
     endif()
 endif()
 if(LDC_WITH_LLD)
-    if(MSVC)
-        list(APPEND LDC_LINKERFLAG_LIST LLVMSymbolize.lib)
-    else()
-        set(LDC_LINKERFLAG_LIST -lLLVMSymbolize ${LDC_LINKERFLAG_LIST})
+    if(LLVM_VERSION_MAJOR GREATER 21)
+        if(MSVC)
+            list(APPEND LDC_LINKERFLAG_LIST LLVMDTLTO.lib)
+        else()
+            set(LDC_LINKERFLAG_LIST -lLLVMDTLTO ${LDC_LINKERFLAG_LIST})
+        endif()
     endif()
     if(MSVC)
-        list(APPEND LDC_LINKERFLAG_LIST lldMinGW.lib lldCOFF.lib lldELF.lib lldMachO.lib lldWasm.lib lldCommon.lib)
+        list(APPEND LDC_LINKERFLAG_LIST lldMinGW.lib lldCOFF.lib lldELF.lib lldMachO.lib lldWasm.lib lldCommon.lib LLVMSymbolize.lib)
     else()
-        set(LDC_LINKERFLAG_LIST -llldMinGW -llldCOFF -llldELF -llldMachO -llldWasm -llldCommon ${LDC_LINKERFLAG_LIST})
-    endif()
-    if(APPLE)
-        # LLD 13.0.0 on Mac needs libxar
-        list(APPEND LDC_LINKERFLAG_LIST -lxar)
+        set(LDC_LINKERFLAG_LIST -llldMinGW -llldCOFF -llldELF -llldMachO -llldWasm -llldCommon -lLLVMSymbolize ${LDC_LINKERFLAG_LIST})
     endif()
     if(${CMAKE_SYSTEM_NAME} MATCHES "FreeBSD")
         # FreeBSD LLVM port links to zstd, but does not convey this information via CMake
@@ -833,7 +837,7 @@ if (LDC_INSTALL_LLVM_RUNTIME_LIBS)
         if(CMAKE_SIZEOF_VOID_P EQUAL 4)
             set(compilerrt_arch_suffix "i386")
         endif()
-        if(LDC_LLVM_VER LESS 2000)
+        if(LLVM_VERSION_MAJOR LESS 20)
             copy_compilerrt_lib("clang_rt.asan-${compilerrt_arch_suffix}.lib" "ldc_rt.asan.lib" FALSE)
             copy_compilerrt_lib("clang_rt.lsan-${compilerrt_arch_suffix}.lib" "ldc_rt.lsan.lib" FALSE)
         else()
