@@ -17,6 +17,7 @@
 #include "dmd/identifier.h"
 #include "dmd/module.h"
 #include "dmd/template.h"
+#include <cstring>
 
 using namespace dmd;
 
@@ -41,6 +42,39 @@ bool isFromLDC_DCompute(Dsymbol *sym) {
 }
 bool isFromLDC_OpenCL(Dsymbol *sym) {
   return isFromLDC_Mod(sym,Id::opencl);
+}
+
+static bool isFromDComputeStdMod(Dsymbol *sym, Identifier *leaf) {
+  Module *mod = sym->getModule();
+  if (!mod)
+    return false;
+  ModuleDeclaration *md = mod->md;
+  if (!md || md->id != leaf)
+    return false;
+  if (md->packages.length != 2)
+    return false;
+  return md->packages.ptr[0] == Id::dcompute && md->packages.ptr[1] == Id::std;
+}
+
+bool isDComputeBFloat16(StructDeclaration *sd) {
+  if (sd->ident != Id::BFloat16 && sd->ident != Id::DeviceBFloat16)
+    return false;
+  if (isFromDComputeStdMod(sd, Id::bfloat16))
+    return true;
+  // Codegen tests may embed an equivalent `BFloat16` in a different module.
+  if (sd->sizeok != Sizeok::done || sd->structsize != 2 ||
+      sd->fields.length != 1)
+    return false;
+  VarDeclaration *rep = sd->fields[0];
+  return std::strcmp(rep->ident->toChars(), "rep") == 0 &&
+         rep->type->toBasetype()->ty == TY::Tuns16;
+}
+
+bool isDComputeBFloat16Type(Type *t) {
+  t = t->toBasetype();
+  if (t->ty != TY::Tstruct)
+    return false;
+  return isDComputeBFloat16(static_cast<TypeStruct *>(t)->sym);
 }
 
 std::optional<DcomputePointer> toDcomputePointer(StructDeclaration *sd) {

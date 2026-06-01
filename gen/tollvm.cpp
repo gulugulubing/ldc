@@ -24,6 +24,8 @@
 #include "gen/complex.h"
 #include "gen/dvalue.h"
 #include "gen/functions.h"
+#include "gen/dcompute/druntime.h"
+#include "gen/dcompute/target.h"
 #include "gen/irstate.h"
 #include "gen/linkage.h"
 #include "gen/llvm.h"
@@ -189,7 +191,14 @@ LLType *DtoType(Type *t) {
   return nullptr;
 }
 
-LLType *DtoMemType(Type *t) { return i1ToI8(voidToI8(DtoType(t))); }
+LLType *DtoMemType(Type *t) {
+  t = stripModifiers(t);
+  if (gIR->dcomputetarget &&
+      gIR->dcomputetarget->target == DComputeTarget::ID::Metal &&
+      isDComputeBFloat16Type(t))
+    return llvm::Type::getBFloatTy(gIR->context());
+  return i1ToI8(voidToI8(DtoType(t)));
+}
 
 LLType *voidToI8(LLType *t) {
   return t->isVoidTy() ? LLType::getInt8Ty(t->getContext()) : t;

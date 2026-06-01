@@ -1012,6 +1012,19 @@ void DtoDefineFunction(FuncDeclaration *fd, bool linkageAvailableExternally) {
     return;
   }
 
+  // Imported @compute helpers may not have had semantic3 run yet when their
+  // module is emitted before the referencing kernel module.
+  if (gIR->dcomputetarget && fd->fbody &&
+      fd->semanticRun() < PASS::semantic3done) {
+    if (!functionSemantic3(fd)) {
+      IF_LOG Logger::println("Skipping '%s'; semantic3 failed.",
+                             fd->toPrettyChars());
+      fd->ir->setDefined();
+      return;
+    }
+    runDeferredSemantic3();
+  }
+
   if (fd->semanticRun() == PASS::semanticdone) {
     // This function failed semantic3() with errors but the errors were gagged.
     // In contrast to DMD we immediately bail out here, since other parts of

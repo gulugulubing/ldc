@@ -26,6 +26,10 @@ class Type;
 bool isFromLDC_DCompute(Dsymbol *sym);
 bool isFromLDC_OpenCL(Dsymbol *sym);
 
+/// `dcompute.std.bfloat16.BFloat16` — lowered to LLVM `bfloat` on Metal device.
+bool isDComputeBFloat16(StructDeclaration *sd);
+bool isDComputeBFloat16Type(Type *t);
+
 struct DcomputePointer {
   int addrspace;
   Type *type;

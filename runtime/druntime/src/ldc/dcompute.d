@@ -34,6 +34,11 @@ enum ReflectTarget : uint
 pure nothrow @nogc
 extern(C) bool __dcompute_reflect(ReflectTarget t, uint _version = 0);
 
+/// Metal device: `fpext` from raw BF16 bits (see `dcompute.std.bfloat16`).
+extern(C) float __ldc_bfloat16_to_float(ushort bits) pure @nogc nothrow;
+/// Metal device: `fptrunc` to raw BF16 bits (see `dcompute.std.bfloat16`).
+extern(C) ushort __ldc_float_to_bfloat16(float f) pure @nogc nothrow;
+
 ///Readability aliases for compute
 enum CompileFor : int
 {

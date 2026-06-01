@@ -18,6 +18,8 @@
 #include "gen/abi/abi.h"
 #include "gen/arrays.h"
 #include "gen/classes.h"
+#include "gen/dcompute/druntime.h"
+#include "gen/dcompute/target.h"
 #include "gen/dvalue.h"
 #include "gen/funcgenstate.h"
 #include "gen/functions.h"
@@ -630,6 +632,46 @@ bool DtoLowerMagicIntrinsic(IRState *p, FuncDeclaration *fndecl, CallExp *e,
   return false;
 }
 
+/// Lower `__ldc_bfloat16_to_float` / `__ldc_float_to_bfloat16` on Metal device.
+static bool DtoLowerDComputeBFloat16Builtin(FuncDeclaration *fd,
+                                            Expressions *arguments,
+                                            DValue *&result) {
+  if (!gIR->dcomputetarget ||
+      gIR->dcomputetarget->target != DComputeTarget::ID::Metal)
+    return false;
+
+  auto &ctx = gIR->context();
+  auto *bfTy = llvm::Type::getBFloatTy(ctx);
+  auto *fTy = llvm::Type::getFloatTy(ctx);
+  auto *i16Ty = llvm::Type::getInt16Ty(ctx);
+
+  if (fd->ident == Id::ldcBfloat16ToFloat) {
+    if (!arguments || arguments->length != 1) {
+      error(fd->loc, "`__ldc_bfloat16_to_float` expects 1 argument");
+      fatal();
+    }
+    LLValue *bits = DtoRVal(toElem((*arguments)[0]));
+    LLValue *i16 = gIR->ir->CreateZExt(bits, i16Ty);
+    LLValue *bf = gIR->ir->CreateBitCast(i16, bfTy);
+    result = new DImValue(Type::tfloat32, gIR->ir->CreateFPExt(bf, fTy));
+    return true;
+  }
+
+  if (fd->ident == Id::ldcFloatToBfloat16) {
+    if (!arguments || arguments->length != 1) {
+      error(fd->loc, "`__ldc_float_to_bfloat16` expects 1 argument");
+      fatal();
+    }
+    LLValue *f = DtoRVal(toElem((*arguments)[0]));
+    LLValue *bf = gIR->ir->CreateFPTrunc(f, bfTy);
+    LLValue *i16 = gIR->ir->CreateBitCast(bf, i16Ty);
+    result = new DImValue(Type::tuns16, i16);
+    return true;
+  }
+
+  return false;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 class ImplicitArgumentsBuilder {
@@ -848,6 +890,12 @@ DValue *DtoCallFunction(Loc loc, Type *resulttype, DValue *fnval,
 
   // get func value if any
   DFuncValue *const dfnval = fnval->isFunc();
+
+  if (dfnval) {
+    DValue *builtinResult = nullptr;
+    if (DtoLowerDComputeBFloat16Builtin(dfnval->func, arguments, builtinResult))
+      return builtinResult;
+  }
 
   // get function type info
   IrFuncTy &irFty = DtoIrTypeFunction(fnval);

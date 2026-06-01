@@ -78,6 +78,16 @@ bool skipCodegen(FuncDeclaration &fdecl) {
   if (fdecl.isFuncLiteralDeclaration()) // emitted into each referencing CU
     return false;
 
+  // Device codegen merges all reachable @compute modules into one AIR/PTX/SPIR-V
+  // module. Functions in imported (non-root) @compute library modules must still
+  // be defined there; DMD's inNonRoot() would otherwise suppress them.
+  if (gIR->dcomputetarget) {
+    if (Module *m = fdecl.getModule()) {
+      if (hasComputeAttr(m) != DComputeCompileFor::hostOnly)
+        return false;
+    }
+  }
+
   for (FuncDeclaration *f = &fdecl; f;) {
     if (f->inNonRoot()) { // false if instantiated
       return true;

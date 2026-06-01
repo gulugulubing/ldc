@@ -42,6 +42,9 @@ struct DComputeSemanticAnalyser : public StoppableVisitor {
     FuncDeclaration *f = ce->f;
     if (f->ident == Id::dcReflect)
       return true;
+    if (f->ident == Id::ldcBfloat16ToFloat ||
+        f->ident == Id::ldcFloatToBfloat16)
+      return true;
     if (currentFunction == nullptr)
       return false;
     TemplateInstance *inst = currentFunction->isInstantiated();

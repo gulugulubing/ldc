@@ -77,7 +77,12 @@ struct Id
     static Identifier *LDC_extern_weak;
     static Identifier *LDC_profile_instr;
     static Identifier *dcReflect;
+    static Identifier *ldcBfloat16ToFloat;
+    static Identifier *ldcFloatToBfloat16;
     static Identifier *opencl;
+    static Identifier *bfloat16;
+    static Identifier *BFloat16;
+    static Identifier *DeviceBFloat16;
     static Identifier *criticalenter;
     static Identifier *criticalexit;
     static Identifier *attributes;

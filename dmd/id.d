@@ -596,8 +596,13 @@ immutable Msgtable[] msgtable =
     { "dcompute" },
     { "dcPointer", "Pointer" },
     { "dcReflect", "__dcompute_reflect" },
+    { "ldcBfloat16ToFloat", "__ldc_bfloat16_to_float" },
+    { "ldcFloatToBfloat16", "__ldc_float_to_bfloat16" },
     { "RTInfoImpl" },
     { "opencl" },
+    { "bfloat16" },
+    { "BFloat16" },
+    { "DeviceBFloat16" },
 
     // IN_LLVM
     { "io" },

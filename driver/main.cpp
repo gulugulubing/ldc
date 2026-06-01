@@ -51,6 +51,7 @@
 #include "gen/passes/Passes.h"
 #include "gen/runtime.h"
 #include "gen/uda.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/IR/LLVMContext.h"
@@ -1276,8 +1277,45 @@ void codegenModules(Modules &modules) {
     }
 
     if (!computeModules.empty()) {
+      // Imported @compute modules are semantically analyzed (Module::amodules)
+      // but are not necessarily listed in the root `modules` array passed on
+      // the command line. Device codegen must still emit their definitions into
+      // the shared AIR/PTX/SPIR-V module; otherwise cross-module calls from
+      // deviceOnly kernels are left as unresolved declares.
+      llvm::SmallPtrSet<Module *, 16> seen;
+      for (Module *m : computeModules)
+        seen.insert(m);
+
+      std::vector<Module *> importedComputeModules;
+      for (d_size_t i = 0; i < Module::amodules.length; ++i) {
+        Module *m = Module::amodules[i];
+        if (m->filetype == FileType::dhdr)
+          continue;
+        const auto atCompute = hasComputeAttr(m);
+        if (atCompute == DComputeCompileFor::hostOnly)
+          continue;
+        if (seen.insert(m).second)
+          importedComputeModules.push_back(m);
+      }
+
+      // Emit @compute(hostAndDevice) helpers before deviceOnly kernels when
+      // possible so bodies exist before kernel codegen references them.
+      std::vector<Module *> deviceModules;
+      deviceModules.reserve(computeModules.size() +
+                            importedComputeModules.size());
+      for (Module *m : importedComputeModules) {
+        if (hasComputeAttr(m) == DComputeCompileFor::hostAndDevice)
+          deviceModules.push_back(m);
+      }
+      for (Module *m : computeModules)
+        deviceModules.push_back(m);
+      for (Module *m : importedComputeModules) {
+        if (hasComputeAttr(m) == DComputeCompileFor::deviceOnly)
+          deviceModules.push_back(m);
+      }
+
       dmd::TimeTraceScope timeScope("Codegen DCompute device modules");
-      for (auto &mod : computeModules) {
+      for (Module *mod : deviceModules) {
         dmd::TimeTraceScope timeScope(
             TimeTraceEventType::codegenModule,
             (llvm::Twine("Codegen DCompute: device module ") + mod->toChars())

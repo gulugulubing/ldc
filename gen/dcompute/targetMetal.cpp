@@ -230,6 +230,12 @@ static void eraseUnusedNonKernelFunctions(
 // TargetMetal
 // ═══════════════════════════════════════════════════════════════════════════
 
+std::string metalBufferElementTypeName(Type *ty) {
+  if (isDComputeBFloat16Type(ty))
+    return "bfloat";
+  return ty->toChars();
+}
+
 class TargetMetal : public DComputeTarget {
 public:
   TargetMetal(llvm::LLVMContext &c, int version)
@@ -553,7 +559,7 @@ private:
     bool isConst = (ptr.type->mod & (MODconst | MODimmutable)) != 0;
     const char *accessMode = isConst ? "air.read" : "air.read_write";
 
-    std::string typeName = ptr.type->toChars();
+    std::string typeName = metalBufferElementTypeName(ptr.type);
 
     llvm::Metadata *fields[] = {
         ci(paramIdx),

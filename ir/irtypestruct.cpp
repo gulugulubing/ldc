@@ -70,6 +70,19 @@ IrTypeStruct *IrTypeStruct::get(StructDeclaration *sd) {
     dcomputeTypes.push_back(t);
   }
 
+  if (gIR->dcomputetarget &&
+      gIR->dcomputetarget->target == DComputeTarget::ID::Metal &&
+      isDComputeBFloat16(sd)) {
+    llvm::SmallVector<LLType *, 1> body;
+    body.push_back(llvm::Type::getBFloatTy(getGlobalContext()));
+    isaStruct(t->type)->setBody(body, false);
+    VarGEPIndices v;
+    v[sd->fields[0]] = 0;
+    t->varGEPIndices = v;
+    dcomputeTypes.push_back(t);
+    return t;
+  }
+
   // For ldc.dcomptetypes.Pointer!(uint n,T),
   // emit { T addrspace(gIR->dcomputetarget->mapping[n])* }
   std::optional<DcomputePointer> p;
