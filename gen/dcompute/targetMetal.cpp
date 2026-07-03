@@ -163,7 +163,7 @@ static void runMetalAIRCleanupPasses(llvm::Module &M) {
   // - explicit GEP no-wrap flags such as `nuw` (not arithmetic `nuw`/`nsw`)
   // Strip those while preserving older, Apple-accepted forms such as
   // `getelementptr inbounds`.
-#if LDC_LLVM_VER >= 2000
+#if LLVM_VERSION_MAJOR >= 20
   for (llvm::Function &F : M) {
     if (F.isDeclaration())
       continue;
@@ -253,7 +253,7 @@ public:
 
     // Align with Metallib expectations for Xcode 26-era Metal toolchain.
     std::string tripleStr(kMetalAirTargetTriple);
-#if LDC_LLVM_VER >= 2100
+#if LLVM_VERSION_MAJOR >= 21
     _ir->module.setTargetTriple(llvm::Triple(tripleStr));
 #else
     _ir->module.setTargetTriple(tripleStr);
@@ -501,7 +501,7 @@ private:
           // Match Apple-generated kernel signatures: buffer pointer params
           // carry nocapture, noundef, writeonly/readonly, and air-buffer-no-alias.
           llf->addParamAttr(i, llvm::Attribute::NoUndef);
-#if LDC_LLVM_VER >= 2100
+#if LLVM_VERSION_MAJOR >= 21
           {
             llvm::AttrBuilder ab(ctx);
             ab.addCapturesAttr(llvm::CaptureInfo::none());
