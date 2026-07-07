@@ -14,6 +14,7 @@ module dmd.root.region;
 import core.stdc.stdio;
 import core.stdc.string;
 import core.stdc.stdlib;
+import core.memory : GC;
 
 import dmd.root.rmem;
 import dmd.root.array;
@@ -60,6 +61,8 @@ public:
             if (used == array.length)
             {
                 auto h = Mem.check(.malloc(ChunkSize));
+                if (Mem.isGCEnabled)
+                    GC.addRange(h, ChunkSize);
                 array.push(h);
             }
 

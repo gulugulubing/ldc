@@ -122,6 +122,15 @@ public Expression ctfeInterpret(Expression e)
     if (CTFEExp.isCantExp(result))
         result = ErrorExp.get();
 
+    if (ctfeGlobals.numRegionExprs)
+    {
+        import core.stdc.stdio;
+        fprintf(stderr, "[CTFE] %llu exprs + %llu results, region=%llu bytes, gc=%d\n",
+                cast(ulong)ctfeGlobals.numRegionExprs,
+                cast(ulong)ctfeGlobals.numRegionResults,
+                cast(ulong)ctfeGlobals.region.size(), cast(int)mem.isGCEnabled);
+    }
+
     ctfeGlobals.region.release(rgnpos);
 
     return result;
@@ -188,8 +197,7 @@ public Expression getValue(VarDeclaration vd)
  */
 T ctfeEmplaceExp(T : Expression, Args...)(Args args)
 {
-    if (mem.isGCEnabled)
-        return new T(args);
+    ++ctfeGlobals.numRegionExprs;
     auto p = ctfeGlobals.region.malloc(__traits(classInstanceSize, T));
     emplaceExp!T(p, args);
     return cast(T)p;
@@ -202,7 +210,8 @@ public extern (C++) void printCtfePerformanceStats()
     {
         printf("        ---- CTFE Performance ----\n");
         printf("max call depth = %d\tmax stack = %d\n", ctfeGlobals.maxCallDepth, ctfeGlobals.stack.maxStackUsage());
-        printf("array allocs = %d\tassignments = %d\n\n", ctfeGlobals.numArrayAllocs, ctfeGlobals.numAssignments);
+        printf("array allocs = %d\tassignments = %d\n", ctfeGlobals.numArrayAllocs, ctfeGlobals.numAssignments);
+        printf("region exprs = %llu\tregion results = %llu\tregion size = %llu\n", ctfeGlobals.numRegionExprs, ctfeGlobals.numRegionResults, ctfeGlobals.region.size());
     }
 }
 
@@ -235,6 +244,8 @@ struct CtfeGlobals
     int maxCallDepth = 0;     // highest number of recursive calls
     int numArrayAllocs = 0;   // Number of allocated arrays
     int numAssignments = 0;   // total number of assignments executed
+    size_t numRegionExprs = 0; // ctfeEmplaceExp allocations in Region
+    size_t numRegionResults = 0; // interpretRegion allocations in Region
 }
 
 __gshared CtfeGlobals ctfeGlobals;
@@ -6322,8 +6333,6 @@ Expression interpretRegion(Expression e, InterState* istate, CTFEGoal goal = CTF
     auto uexp = ue.exp();
     if (result != uexp)
         return result;
-    if (mem.isGCEnabled)
-        return ue.copy();
 
     // mimicking UnionExp.copy, but with region allocation
     switch (uexp.op)
@@ -6335,6 +6344,7 @@ Expression interpretRegion(Expression e, InterState* istate, CTFEGoal goal = CTF
         case EXP.goto_:          return CTFEExp.gotoexp;
         default:                 break;
     }
+    ++ctfeGlobals.numRegionResults;
     auto p = ctfeGlobals.region.malloc(uexp.size);
     return cast(Expression)memcpy(p, cast(void*)uexp, uexp.size);
 }
