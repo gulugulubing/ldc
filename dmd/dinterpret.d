@@ -122,15 +122,6 @@ public Expression ctfeInterpret(Expression e)
     if (CTFEExp.isCantExp(result))
         result = ErrorExp.get();
 
-    if (ctfeGlobals.numRegionExprs)
-    {
-        import core.stdc.stdio;
-        fprintf(stderr, "[CTFE] %llu exprs + %llu results, region=%llu bytes, gc=%d\n",
-                cast(ulong)ctfeGlobals.numRegionExprs,
-                cast(ulong)ctfeGlobals.numRegionResults,
-                cast(ulong)ctfeGlobals.region.size(), cast(int)mem.isGCEnabled);
-    }
-
     ctfeGlobals.region.release(rgnpos);
 
     return result;
