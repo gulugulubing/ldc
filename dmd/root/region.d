@@ -41,6 +41,10 @@ struct Region
     }
 
 public:
+    /// Set to true when GC is enabled. Causes release() to zero
+    /// out old chunks to prevent stale pointers from creating
+    /// GC false positives during conservative scanning.
+    bool stompOnRelease;
 
     /******
      * Allocate nbytes. Aborts on failure.
@@ -90,25 +94,21 @@ public:
      * Params:
      *  pos = position returned by `savePos()`
      */
-    void release(RegionPos pos) pure @nogc @safe
+    void release(RegionPos pos) pure @nogc @trusted
     {
-        version (all)
+        if (stompOnRelease)
         {
-            /* Recycle the memory. There better not be
-             * any live pointers to it.
+            /* Zero out released memory to prevent GC false positives
+             * from stale pointer values in recycled Region chunks
+             * during conservative scanning.
              */
-            used = pos.used;
-            available = pos.available;
+            import core.stdc.string : memset;
+            memset(pos.available.ptr, 0, pos.available.length);
+            foreach (i; pos.used .. used)
+                memset(array[i], 0, ChunkSize);
         }
-        else
-        {
-            /* Instead of recycling the memory, stomp on it
-             * to flush out any remaining live pointers to it.
-             */
-            (cast(ubyte[])pos.available)[] = 0xFF;
-            foreach (h; array[pos.used .. used])
-                (cast(ubyte*)h)[0 .. ChunkSize] = 0xFF;
-        }
+        used = pos.used;
+        available = pos.available;
     }
 
     /****************************

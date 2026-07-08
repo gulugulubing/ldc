@@ -99,6 +99,7 @@ public Expression ctfeInterpret(Expression e)
     if (e.type.ty == Terror)
         return ErrorExp.get();
 
+    ctfeGlobals.region.stompOnRelease = mem.isGCEnabled;
     auto rgnpos = ctfeGlobals.region.savePos();
 
     import dmd.timetrace;
