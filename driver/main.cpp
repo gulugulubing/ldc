@@ -1223,6 +1223,8 @@ int cppmain() {
 
   const int status = mars_tryMain(global.params, files);
 
+  printGCProfileStats();
+
   // try to remove the temp objects dir if created for -cleanup-obj
   if (!tempObjectsDir.empty())
     llvm::sys::fs::remove(tempObjectsDir);

@@ -31,3 +31,5 @@ struct Mem
 };
 
 extern Mem mem;
+
+extern void printGCProfileStats();

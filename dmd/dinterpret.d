@@ -99,7 +99,6 @@ public Expression ctfeInterpret(Expression e)
     if (e.type.ty == Terror)
         return ErrorExp.get();
 
-    ctfeGlobals.region.stompOnRelease = mem.isGCEnabled;
     auto rgnpos = ctfeGlobals.region.savePos();
 
     import dmd.timetrace;
@@ -205,6 +204,23 @@ public extern (C++) void printCtfePerformanceStats()
         printf("array allocs = %d\tassignments = %d\n", ctfeGlobals.numArrayAllocs, ctfeGlobals.numAssignments);
         printf("region exprs = %llu\tregion results = %llu\tregion size = %llu\n", ctfeGlobals.numRegionExprs, ctfeGlobals.numRegionResults, ctfeGlobals.region.size());
     }
+}
+
+// Print cumulative GC profile stats at end of compilation.
+public extern (C++) void printGCProfileStats()
+{
+    import core.memory;
+    import core.stdc.stdio;
+    if (!mem.isGCEnabled)
+        return;
+    auto s = GC.stats();
+    auto p = GC.profileStats();
+    fprintf(stderr, "[GCSTATS] collections=%llu usedKB=%llu freeKB=%llu pauseMs=%lld maxPauseMs=%lld\n",
+            cast(ulong)p.numCollections,
+            cast(ulong)(s.usedSize / 1024),
+            cast(ulong)(s.freeSize / 1024),
+            cast(long)p.totalPauseTime.total!"msecs",
+            cast(long)p.maxPauseTime.total!"msecs");
 }
 
 /**************************
